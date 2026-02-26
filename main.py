@@ -296,16 +296,17 @@ class SmsLogFetcherThread(QThread):
                 print(f"[{self.serial}] Error parsing SMS log: {e}")
 
 class CallLogFetcherThread(QThread):
-    log_fetched = pyqtSignal(dict, str) # log_data, serial
-    
+    log_fetched = pyqtSignal(dict, str) # dict, serial
+
     def __init__(self, serial):
         super().__init__()
         self.serial = serial
-        
+
     def run(self):
-        time.sleep(3)
+        # We add a slight delay to ensure the OS has written the log before we query
+        time.sleep(1.5)
         success, output = run_adb_command([
-            "shell", "content query --uri content://call_log/calls --projection date:type:number:duration --sort 'date DESC'"
+            "shell", "content query --uri content://call_log/calls --projection date:type:number:duration --sort 'date DESC' --limit 1"
         ], serial=self.serial)
         
         if success and "Row: 0" in output:
