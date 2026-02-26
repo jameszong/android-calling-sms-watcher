@@ -44,8 +44,8 @@ class DbWorkerThread(threading.Thread):
                 table, data = task
                 if table == "calls":
                     cursor.execute('''
-                        INSERT INTO calls (time, direction, number, duration, device_id)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO calls (time, direction, number, duration, device_id, recording_file)
+                        VALUES (?, ?, ?, ?, ?, ?)
                     ''', data)
                 elif table == "sms":
                     cursor.execute('''
@@ -74,7 +74,8 @@ def init_db():
             direction TEXT,
             number TEXT,
             duration TEXT,
-            device_id TEXT
+            device_id TEXT,
+            recording_file TEXT
         )
     ''')
     cursor.execute('''
@@ -94,9 +95,14 @@ def init_db():
         )
     ''')
     
-    # DB Migration: Check and add device_id column if it doesn't exist
+    # DB Migration: Check and add columns if they don't exist
     try:
         cursor.execute("ALTER TABLE calls ADD COLUMN device_id TEXT")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+        
+    try:
+        cursor.execute("ALTER TABLE calls ADD COLUMN recording_file TEXT")
     except sqlite3.OperationalError:
         pass # Column already exists
         
@@ -223,6 +229,147 @@ def run_adb_command(cmd_args, timeout=5, serial=None, input_str=None):
     except Exception as e:
         return False, str(e)
 
+class DeviceRecorder:
+    def __init__(self, serial):
+        self.serial = serial
+
+    def start_recording(self):
+        pass
+
+    def stop_recording_process(self):
+        pass
+
+    def save_recording(self, phone_number, call_time):
+        return None
+
+class ModernRecorder(DeviceRecorder):
+    def __init__(self, serial):
+        super().__init__(serial)
+        self.process = None
+        safe_serial = self.serial.replace(':', '_').replace('.', '_')
+        self.temp_file = os.path.join(os.getcwd(), f"temp_{safe_serial}.opus")
+
+    def start_recording(self):
+        scrcpy_path = get_setting("scrcpy_path", "scrcpy")
+        cmd = [
+            scrcpy_path,
+            "-s", self.serial,
+            "--no-video",
+            "--no-window",
+            "--audio-codec=opus",
+            "--record", self.temp_file
+        ]
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                self.process = subprocess.Popen(
+                    cmd, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    startupinfo=startupinfo,
+                    text=True
+                )
+                
+                time.sleep(1)
+                if self.process.poll() is not None:
+                    err = self.process.stderr.read()
+                    print(f"[{self.serial}] Scrcpy failed (attempt {attempt+1}): {err}")
+                    if "device busy" in err.lower() or "error" in err.lower():
+                        continue
+                    else:
+                        break
+                else:
+                    print(f"[{self.serial}] Scrcpy recording started successfully.")
+                    break
+            except Exception as e:
+                print(f"[{self.serial}] Error launching scrcpy: {e}")
+                break
+
+    def stop_recording_process(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            self.process = None
+
+    def save_recording(self, phone_number, call_time):
+        if os.path.exists(self.temp_file):
+            safe_serial = self.serial.replace(':', '_').replace('.', '_')
+            safe_time = call_time.replace(':', '').replace('-', '').replace(' ', '_')
+            final_name = f"Call_{safe_serial}_{phone_number}_{safe_time}.opus"
+            final_path = os.path.join(os.getcwd(), "call_logs", final_name)
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+            try:
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                os.rename(self.temp_file, final_path)
+                return final_path
+            except Exception as e:
+                print(f"[{self.serial}] Error renaming recording file: {e}")
+                return self.temp_file
+        return None
+
+class LegacyRecorder(DeviceRecorder):
+    def __init__(self, serial):
+        super().__init__(serial)
+
+    def start_recording(self):
+        pass
+
+    def stop_recording_process(self):
+        pass
+
+    def save_recording(self, phone_number, call_time):
+        time.sleep(3)
+        
+        search_script = r"""
+        for d in /sdcard/MIUI/sound_recorder/call_rec /sdcard/Recordings/Call /sdcard/Music/Recordings/Call /sdcard/Sounds/CallRecord; do
+            if [ -d "$d" ]; then
+                file=$(ls -t "$d" | grep -E '\.(mp3|m4a|amr|wav|aac)$' | head -n 1)
+                if [ -n "$file" ]; then
+                    echo "$d/$file"
+                    exit 0
+                fi
+            fi
+        done
+        """
+        success, output = run_adb_command(["shell", search_script], serial=self.serial)
+        
+        remote_file = output.strip() if success else ""
+        if remote_file and remote_file.startswith("/"):
+            ext = remote_file.split('.')[-1]
+            safe_serial = self.serial.replace(':', '_').replace('.', '_')
+            safe_time = call_time.replace(':', '').replace('-', '').replace(' ', '_')
+            final_name = f"Call_{safe_serial}_{phone_number}_{safe_time}.{ext}"
+            final_path = os.path.join(os.getcwd(), "call_logs", final_name)
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+            
+            pull_success, _ = run_adb_command(["pull", remote_file, final_path], serial=self.serial)
+            if pull_success:
+                return final_path
+        return None
+
+class RecorderFactory:
+    @staticmethod
+    def create_recorder(serial):
+        success, output = run_adb_command(["shell", "getprop", "ro.build.version.release"], serial=serial)
+        try:
+            version = int(output.strip().split('.')[0])
+        except Exception:
+            version = 10
+
+        if version >= 11:
+            print(f"[{serial}] Android {version} detected, using ModernRecorder.")
+            return ModernRecorder(serial)
+        else:
+            print(f"[{serial}] Android {version} detected, using LegacyRecorder.")
+            return LegacyRecorder(serial)
+
 def pair_device(ip, pair_port, pairing_code):
     """Executes `adb pair <ip>:<pair_port> <pairing_code>`."""
     target = f"{ip}:{pair_port}"
@@ -296,18 +443,28 @@ class SmsLogFetcherThread(QThread):
                 print(f"[{self.serial}] Error parsing SMS log: {e}")
 
 class CallLogFetcherThread(QThread):
-    log_fetched = pyqtSignal(dict, str) # dict, serial
+    log_fetched = pyqtSignal(dict, str, str) # dict, serial, recording_file_path
 
-    def __init__(self, serial):
+    def __init__(self, serial, recorder=None):
         super().__init__()
         self.serial = serial
+        self.recorder = recorder
 
     def run(self):
+        # Immediate stop recording process if using ModernRecorder
+        if self.recorder:
+            self.recorder.stop_recording_process()
+            
         # We add a slight delay to ensure the OS has written the log before we query
+        # Also gives legacy recorder a moment before fetching logs if needed, but legacy delays in save_recording
         time.sleep(1.5)
+        
         success, output = run_adb_command([
             "shell", "content query --uri content://call_log/calls --projection date:type:number:duration --sort 'date DESC' --limit 1"
         ], serial=self.serial)
+        
+        recording_file = ""
+        log_data = {}
         
         if success and "Row: 0" in output:
             try:
@@ -317,37 +474,40 @@ class CallLogFetcherThread(QThread):
                         first_row = line
                         break
                 
-                if not first_row:
-                    return
+                if first_row:
+                    data_str = first_row.replace("Row: 0 ", "")
+                    parts = data_str.split(',')
                     
-                data_str = first_row.replace("Row: 0 ", "")
-                parts = data_str.split(',')
-                
-                log_data = {}
-                for part in parts:
-                    if '=' in part:
-                        k, v = part.split('=', 1)
-                        log_data[k.strip()] = v.strip()
-                
-                if 'date' in log_data:
-                    dt = datetime.datetime.fromtimestamp(int(log_data['date'])/1000)
-                    log_data['formatted_time'] = dt.strftime("%Y-%m-%d %H:%M:%S")
-                
-                if 'type' in log_data:
-                    type_map = {'1': '呼入', '2': '呼出', '3': '未接', '5': '拒接'}
-                    log_data['direction'] = type_map.get(log_data['type'], f"其他({log_data['type']})")
-                
-                if 'duration' in log_data:
-                    dur_seconds = int(log_data['duration'])
-                    if log_data.get('type') in ['3', '5']:
-                        dur_seconds = 0
-                    m, s = divmod(dur_seconds, 60)
-                    h, m = divmod(m, 60)
-                    log_data['formatted_duration'] = f"{h}:{m:02d}:{s:02d}"
-                
-                self.log_fetched.emit(log_data, self.serial)
+                    for part in parts:
+                        if '=' in part:
+                            k, v = part.split('=', 1)
+                            log_data[k.strip()] = v.strip()
+                    
+                    if 'date' in log_data:
+                        dt = datetime.datetime.fromtimestamp(int(log_data['date'])/1000)
+                        log_data['formatted_time'] = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    if 'type' in log_data:
+                        type_map = {'1': '呼入', '2': '呼出', '3': '未接', '5': '拒接'}
+                        log_data['direction'] = type_map.get(log_data['type'], f"其他({log_data['type']})")
+                    
+                    if 'duration' in log_data:
+                        dur_seconds = int(log_data['duration'])
+                        if log_data.get('type') in ['3', '5']:
+                            dur_seconds = 0
+                        m, s = divmod(dur_seconds, 60)
+                        h, m = divmod(m, 60)
+                        log_data['formatted_duration'] = f"{h}:{m:02d}:{s:02d}"
+                        
+                    # Now we have phone number and time, we can save the recording
+                    if self.recorder and log_data.get('duration', '0') != '0' and log_data.get('type') not in ['3', '5']:
+                        rec_path = self.recorder.save_recording(log_data.get('number', 'unknown'), log_data.get('formatted_time', ''))
+                        if rec_path:
+                            recording_file = rec_path
             except Exception as e:
                 print(f"[{self.serial}] Error parsing call log: {e}")
+                
+        self.log_fetched.emit(log_data, self.serial, recording_file)
 
 class AdbMonitorThread(QThread):
     call_state_changed = pyqtSignal(int, str) # state, serial
@@ -359,6 +519,7 @@ class AdbMonitorThread(QThread):
         self.running = True
         self.last_state = -1
         self.last_sms_id = None
+        self.recorder = RecorderFactory.create_recorder(serial)
 
     def run(self):
         print(f"[{self.serial}] Started monitoring...")
@@ -682,6 +843,8 @@ class SettingsDialog(QDialog):
                 QMessageBox.critical(self, "失败", f"推送失败: {msg}")
 
     def save_settings(self):
+        set_setting("scrcpy_path", self.scrcpy_input.text().strip() or "scrcpy")
+        
         index = self.type_combo.currentIndex()
         if index == 0:
             set_setting("notification_type", "WeCom")
@@ -779,11 +942,12 @@ class MainWindow(QMainWindow):
         self.call_tab = QWidget()
         call_layout = QVBoxLayout(self.call_tab)
         self.call_table = QTableWidget()
-        self.call_table.setColumnCount(5)
-        self.call_table.setHorizontalHeaderLabels(["时间", "设备", "方向", "号码", "通话时长"])
+        self.call_table.setColumnCount(6)
+        self.call_table.setHorizontalHeaderLabels(["时间", "设备", "方向", "号码", "通话时长", "录音文件"])
         self.call_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.call_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.call_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.call_table.cellDoubleClicked.connect(self.open_recording_file)
         call_layout.addWidget(self.call_table)
         self.tabs.addTab(self.call_tab, "通话记录")
         
@@ -888,8 +1052,18 @@ class MainWindow(QMainWindow):
     
     def handle_call_state(self, state, serial):
         print(f"[{serial}] Call state changed to: {state}")
-        if state == 0: # Idle / Ended
-            fetcher = CallLogFetcherThread(serial)
+        
+        # Get the recorder for this device
+        recorder = None
+        if serial in self.device_threads:
+            recorder = self.device_threads[serial].recorder
+            
+        if state > 0: # Ringing or Offhook (Active call)
+            if recorder:
+                threading.Thread(target=recorder.start_recording, daemon=True).start()
+                
+        elif state == 0: # Idle / Ended
+            fetcher = CallLogFetcherThread(serial, recorder)
             fetcher.log_fetched.connect(self.save_and_display_call_log)
             self.active_fetchers.append(fetcher)
             fetcher.finished.connect(lambda f=fetcher: self.active_fetchers.remove(f))
@@ -903,7 +1077,7 @@ class MainWindow(QMainWindow):
         fetcher.finished.connect(lambda f=fetcher: self.active_fetchers.remove(f))
         fetcher.start()
 
-    def save_and_display_call_log(self, log_data, serial):
+    def save_and_display_call_log(self, log_data, serial, recording_file=""):
         if not log_data:
             return
             
@@ -913,7 +1087,7 @@ class MainWindow(QMainWindow):
         duration = log_data.get('formatted_duration', '0:00:00')
         
         # Dispatch DB write task to the dedicated worker queue
-        db_queue.put(("calls", (time_str, direction, number, duration, serial)))
+        db_queue.put(("calls", (time_str, direction, number, duration, serial, recording_file)))
         
         # Give DB thread a moment to process before reloading UI
         QTimer.singleShot(100, self.load_call_data)
@@ -926,6 +1100,8 @@ class MainWindow(QMainWindow):
             "号码": number,
             "通话时长": duration
         }
+        if recording_file:
+            push_data["录音文件"] = recording_file
         
         notif_type = get_setting("notification_type", "WeCom")
         if notif_type == "WeCom":
@@ -973,37 +1149,90 @@ class MainWindow(QMainWindow):
             if token and chat_id:
                 threading.Thread(target=send_telegram_message, args=(token, chat_id, "✉️ 新的短信记录", push_data), daemon=True).start()
 
+    def save_and_display_sms_log(self, log_data, serial):
+        if not log_data:
+            return
+            
+        time_str = log_data.get('formatted_time', '')
+        direction = log_data.get('direction', '')
+        number = log_data.get('number', '')
+        body = log_data.get('body', '')
+        
+        # Dispatch DB write task to the dedicated worker queue
+        db_queue.put(("sms", (time_str, direction, number, body, serial)))
+        
+        # Give DB thread a moment to process before reloading UI
+        QTimer.singleShot(100, self.load_sms_data)
+        
+        # Push notification
+        push_data = {
+            "设备来源": serial,
+            "时间": time_str,
+            "方向": direction,
+            "号码": number,
+            "短信内容": body
+        }
+        
+        notif_type = get_setting("notification_type", "WeCom")
+        if notif_type == "WeCom":
+            webhook = get_setting("wecom_webhook", "")
+            if webhook:
+                threading.Thread(target=send_wecom_markdown, args=(webhook, "✉️ 新的短信记录", push_data), daemon=True).start()
+        elif notif_type == "Telegram":
+            token = get_setting("tg_bot_token", "")
+            chat_id = get_setting("tg_chat_id", "")
+            if token and chat_id:
+                threading.Thread(target=send_telegram_message, args=(token, chat_id, "✉️ 新的短信记录", push_data), daemon=True).start()
+
     def load_call_data(self):
         self.call_table.setRowCount(0)
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute('SELECT time, device_id, direction, number, duration FROM calls ORDER BY id DESC')
-        rows = cursor.fetchall()
-        
-        for row_data in rows:
-            row_idx = self.call_table.rowCount()
-            self.call_table.insertRow(row_idx)
-            for col_idx, data in enumerate(row_data):
-                item = QTableWidgetItem(str(data if data else ""))
-                self.call_table.setItem(row_idx, col_idx, item)
-                
+        try:
+            cursor.execute('SELECT time, device_id, direction, number, duration, recording_file FROM calls ORDER BY id DESC')
+            for row_data in cursor.fetchall():
+                row_number = self.call_table.rowCount()
+                self.call_table.insertRow(row_number)
+                for column_number, data in enumerate(row_data):
+                    item = QTableWidgetItem(str(data) if data is not None else "")
+                    self.call_table.setItem(row_number, column_number, item)
+        except sqlite3.OperationalError as e:
+            print(f"DB load error: {e}")
         conn.close()
+
+    def open_recording_file(self, row, column):
+        if column == 5: # Recording File column
+            item = self.call_table.item(row, column)
+            if item and item.text():
+                file_path = item.text()
+                if os.path.exists(file_path):
+                    if sys.platform == 'win32':
+                        os.startfile(file_path)
+                    elif sys.platform == 'darwin':
+                        subprocess.call(['open', file_path])
+                    else:
+                        subprocess.call(['xdg-open', file_path])
+                else:
+                    QMessageBox.warning(self, "文件未找到", "录音文件不存在或已被移动。")
 
     def load_sms_data(self):
         self.sms_table.setRowCount(0)
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute('SELECT time, device_id, direction, number, content FROM sms ORDER BY id DESC')
-        rows = cursor.fetchall()
-        
-        for row_data in rows:
-            row_idx = self.sms_table.rowCount()
-            self.sms_table.insertRow(row_idx)
-            for col_idx, data in enumerate(row_data):
-                item = QTableWidgetItem(str(data if data else ""))
-                if col_idx == 4:
-                    item.setToolTip(str(data if data else ""))
-                self.sms_table.setItem(row_idx, col_idx, item)
+        try:
+            cursor.execute('SELECT time, device_id, direction, number, content FROM sms ORDER BY id DESC')
+            rows = cursor.fetchall()
+            
+            for row_data in rows:
+                row_idx = self.sms_table.rowCount()
+                self.sms_table.insertRow(row_idx)
+                for col_idx, data in enumerate(row_data):
+                    item = QTableWidgetItem(str(data if data else ""))
+                    if col_idx == 4:
+                        item.setToolTip(str(data if data else ""))
+                    self.sms_table.setItem(row_idx, col_idx, item)
+        except sqlite3.OperationalError as e:
+            print(f"DB load error: {e}")
                 
         conn.close()
 
