@@ -251,8 +251,18 @@ class ModernRecorder(DeviceRecorder):
 
     def start_recording(self):
         scrcpy_path = get_setting("scrcpy_path", "scrcpy")
+        
+        # Determine actual scrcpy executable
+        exe_path = scrcpy_path
+        if os.path.isdir(scrcpy_path):
+            exe_path = os.path.join(scrcpy_path, "scrcpy.exe")
+        elif not scrcpy_path.lower().endswith('.exe') and scrcpy_path != "scrcpy":
+            # Might be a path without .exe
+            if os.path.exists(scrcpy_path + ".exe"):
+                exe_path = scrcpy_path + ".exe"
+
         cmd = [
-            scrcpy_path,
+            exe_path,
             "-s", self.serial,
             "--no-video",
             "--no-window",
@@ -284,6 +294,9 @@ class ModernRecorder(DeviceRecorder):
                 else:
                     print(f"[{self.serial}] Scrcpy recording started successfully.")
                     break
+            except FileNotFoundError:
+                print(f"[{self.serial}] Scrcpy executable not found at '{exe_path}'. Please check Settings.")
+                break
             except Exception as e:
                 print(f"[{self.serial}] Error launching scrcpy: {e}")
                 break
