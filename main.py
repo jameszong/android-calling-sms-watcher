@@ -732,7 +732,7 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         
         # --- Scrcpy Config ---
-        scrcpy_layout = QVBoxLayout()
+        scrcpy_layout = QHBoxLayout()
         scrcpy_layout.addWidget(QLabel("<b>Scrcpy 路径 (用于 Android 11+ 通话录音):</b>"))
         self.scrcpy_input = QLineEdit()
         self.scrcpy_input.setText(get_setting("scrcpy_path", "scrcpy"))
