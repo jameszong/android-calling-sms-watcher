@@ -8,6 +8,7 @@ import datetime
 import urllib.request
 import json
 import socket
+import queue
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QPushButton, QTableWidget, 
@@ -22,6 +23,46 @@ APP_VERSION = "v1.0.0"
 
 # Database Setup
 DB_FILE = "logs.db"
+
+# DB Worker Queue
+db_queue = queue.Queue()
+
+class DbWorkerThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        
+    def run(self):
+        # Dedicated thread to handle all DB writes sequentially
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        cursor = conn.cursor()
+        while True:
+            try:
+                task = db_queue.get()
+                if task is None: # poison pill
+                    break
+                    
+                table, data = task
+                if table == "calls":
+                    cursor.execute('''
+                        INSERT INTO calls (time, direction, number, duration, device_id)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', data)
+                elif table == "sms":
+                    cursor.execute('''
+                        INSERT INTO sms (time, direction, number, content, device_id)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', data)
+                    
+                conn.commit()
+                db_queue.task_done()
+            except Exception as e:
+                print(f"DB Worker Error: {e}")
+                
+        conn.close()
+
+# Start DB Worker
+db_worker = DbWorkerThread()
+db_worker.start()
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -715,6 +756,8 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(QLabel("已连接的设备:"))
         
         self.device_list_widget = QListWidget()
+        self.device_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.device_list_widget.customContextMenuRequested.connect(self.show_device_context_menu)
         sidebar_layout.addWidget(self.device_list_widget)
         
         btn_add_ip = QPushButton("手动添加 / 配对设备")
@@ -769,6 +812,28 @@ class MainWindow(QMainWindow):
     def open_add_device_dialog(self):
         dialog = AddDeviceDialog(self)
         dialog.exec()
+
+    def show_device_context_menu(self, position):
+        item = self.device_list_widget.itemAt(position)
+        if item:
+            text = item.text()
+            # Extract serial from text (e.g., "🟢 192.168.1.100:5555" -> "192.168.1.100:5555")
+            parts = text.split(' ')
+            if len(parts) >= 2:
+                serial = parts[1]
+                menu = QMenu()
+                disconnect_action = QAction("断开连接", self)
+                disconnect_action.triggered.connect(lambda: self.disconnect_device(serial))
+                menu.addAction(disconnect_action)
+                menu.exec(self.device_list_widget.viewport().mapToGlobal(position))
+
+    def disconnect_device(self, serial):
+        success, output = run_adb_command(["disconnect", serial])
+        if success:
+            QMessageBox.information(self, "断开连接", f"已断开设备: {serial}")
+            self.poll_connected_devices()
+        else:
+            QMessageBox.warning(self, "断开连接失败", f"无法断开设备: {serial}\n{output}")
 
     # --- Device Management ---
     def connect_device(self, target):
@@ -846,16 +911,11 @@ class MainWindow(QMainWindow):
         number = log_data.get('number', '')
         duration = log_data.get('formatted_duration', '0:00:00')
         
-        conn = sqlite3.connect(DB_FILE, timeout=10) # 10 sec timeout for concurrency
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO calls (time, direction, number, duration, device_id)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (time_str, direction, number, duration, serial))
-        conn.commit()
-        conn.close()
+        # Dispatch DB write task to the dedicated worker queue
+        db_queue.put(("calls", (time_str, direction, number, duration, serial)))
         
-        self.load_call_data()
+        # Give DB thread a moment to process before reloading UI
+        QTimer.singleShot(100, self.load_call_data)
         
         # Push notification
         push_data = {
@@ -886,16 +946,11 @@ class MainWindow(QMainWindow):
         number = log_data.get('number', '')
         body = log_data.get('body', '')
         
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO sms (time, direction, number, content, device_id)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (time_str, direction, number, body, serial))
-        conn.commit()
-        conn.close()
+        # Dispatch DB write task to the dedicated worker queue
+        db_queue.put(("sms", (time_str, direction, number, body, serial)))
         
-        self.load_sms_data()
+        # Give DB thread a moment to process before reloading UI
+        QTimer.singleShot(100, self.load_sms_data)
         
         # Push notification
         push_data = {
