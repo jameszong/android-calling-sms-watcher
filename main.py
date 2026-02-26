@@ -417,7 +417,8 @@ class SmsLogFetcherThread(QThread):
     def run(self):
         time.sleep(3)
         success, output = run_adb_command([
-            "shell", "content query --uri content://sms --projection date:type:address:body --sort 'date DESC'"
+            "shell", "content", "query", "--uri", "content://sms", 
+            "--projection", "date:type:address:body", "--sort", "date DESC", "--limit", "1"
         ], serial=self.serial)
         
         if success and "Row: 0" in output:
@@ -473,7 +474,8 @@ class CallLogFetcherThread(QThread):
         time.sleep(1.5)
         
         success, output = run_adb_command([
-            "shell", "content query --uri content://call_log/calls --projection date:type:number:duration --sort 'date DESC' --limit 1"
+            "shell", "content", "query", "--uri", "content://call_log/calls", 
+            "--projection", "date:type:number:duration", "--sort", "date DESC", "--limit", "1"
         ], serial=self.serial)
         
         recording_file = ""
@@ -547,7 +549,7 @@ class AdbMonitorThread(QThread):
             
             # Check SMS state
             success, output = run_adb_command([
-                "shell", "content query --uri content://sms --projection _id --sort 'date DESC'"
+                "shell", "content", "query", "--uri", "content://sms", "--projection", "_id", "--sort", "date DESC", "--limit", "1"
             ], serial=self.serial)
             if success and "Row: 0" in output:
                 latest_id = self.parse_latest_sms_id(output)
@@ -724,10 +726,21 @@ class AddDeviceDialog(QDialog):
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("设置通知方式")
-        self.resize(450, 250)
+        self.setWindowTitle("设置通知方式与录音")
+        self.resize(450, 350)
         
         layout = QVBoxLayout(self)
+        
+        # --- Scrcpy Config ---
+        scrcpy_layout = QVBoxLayout()
+        scrcpy_layout.addWidget(QLabel("<b>Scrcpy 路径 (用于 Android 11+ 通话录音):</b>"))
+        self.scrcpy_input = QLineEdit()
+        self.scrcpy_input.setText(get_setting("scrcpy_path", "scrcpy"))
+        self.scrcpy_input.setPlaceholderText("默认: scrcpy (需在环境变量中)，或填入绝对路径如 D:\\scrcpy\\scrcpy.exe")
+        scrcpy_layout.addWidget(self.scrcpy_input)
+        layout.addLayout(scrcpy_layout)
+        
+        layout.addWidget(QLabel("<hr>"))
         
         # Notification Type Selection
         type_layout = QHBoxLayout()
